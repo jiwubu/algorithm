@@ -124,6 +124,7 @@ class MLA(nn.Module):
       self.num_heads = config.num_heads #16
       self.v_head_dim = config.v_head_dim #128
 
+      #16 * 128 ->7168
       self.out_proj = nn.Linear(
          self.num_heads * self.v_head_dim,
          self.hidden_size,
@@ -142,13 +143,14 @@ class MLA(nn.Module):
       self.kv_lora_rank = config.kv_lora_rank #512
       # 包含两个部分
 
+      # q降维从7168->1536, 压缩比是 1/4.7
       self.q_down_proj = nn.Linear(
          self.hidden_size,
          self.q_lora_rank,
          bias=config.attention_bias,
       )
       self.q_down_norm = DeepseekV2RMSNorm(self.q_lora_rank)
-
+      # kv降维从7168->(512+64),其中512是kv的降维nope部分，64是qk降维的rope部分
       self.kv_down_proj = nn.Linear(
          self.hidden_size,
          self.kv_lora_rank + config.qk_rope_head_dim,
@@ -160,12 +162,16 @@ class MLA(nn.Module):
       # p2.2 升维
       # q and k shape is same
       self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+      # q部分升维: 从1536-> 16个头 * （nope部分:128 + rope部分:64 ）
       self.q_up_proj = nn.Linear(
          self.q_lora_rank,
          self.num_heads * self.q_head_dim,
          bias=config.attention_bias,
       )  # 这里也要 split
 
+      # kv部分升维: 前面从7168->(512+64), 后面要split取nope部分512
+      # 这里升维512->16个头 * （k nope部分:128 + v nope部分:128 ）
+      # 升维后得到K与V，在split
       self.kv_up_proj = nn.Linear(
          self.kv_lora_rank,
          self.num_heads * (
@@ -187,12 +193,14 @@ class MLA(nn.Module):
       # hidden_states (b, seq_len, hidden_dim)
       bsz, q_len, _ = hidden_states.size()
 
-      # 1. q compression
+      # 1. q compression 从7168->1536
       q = self.q_down_proj(
          hidden_states
       )
       q = self.q_down_norm(q)
+      #从1536-> 16个头 * （nope部分:128 + rope部分:64 ）
       q = self.q_up_proj(q)
+
       # q shape 是什么：self.num_heads * self.q_head_dim,
       # (b, seq_len, self.num_heads * self.q_head_dim,)
       q = q.view(
@@ -200,14 +208,16 @@ class MLA(nn.Module):
       ).transpose(1, 2)
       # （b, num_head, seq_len, q_head_dim）
 
+      #拆分为q的nope部分(128)与q的rope部分(64)
       q_nope, q_rope = torch.split(
          q,
          [self.qk_nope_head_dim, self.qk_rope_head_dim],
          dim=-1
       )
 
-      # kv part
+      # kv part 从7168->(512+64),其中512是kv的降维nope部分，64是qk降维的rope部分
       c_kv = self.kv_down_proj(hidden_states)
+      #拆分维kv降维部分512与k的rope部分64
       c_kv, k_rope = torch.split(
          c_kv,
          [self.kv_lora_rank, self.qk_rope_head_dim],  # self.kv_lora_rank + config.qk_rope_head_dim
@@ -219,21 +229,24 @@ class MLA(nn.Module):
       # (b, 1, seq_len, qk_rope_head_dim）)
 
       kv = self.kv_down_norm(c_kv)
+      #升维512->16个头 * （k nope部分:128 + v nope部分:128 ）
       kv = self.kv_up_proj(kv)
-      # （b, seq, num_head * (
-      #     self.q_head_dim - config.qk_rope_head_dim + self.v_head_dim,
-      # )
 
+      # （b, seq, num_head * (self.q_head_dim - config.qk_rope_head_dim + self.v_head_dim)
+      # 每个头（128 + 128）
       kv = kv.view(
          bsz, q_len, self.num_heads,
          self.qk_nope_head_dim + self.v_head_dim
       ).transpose(1, 2)
 
+      #拆分到K的nope部分与V的部分
       k_nope, value_states = torch.split(
          kv,
          [self.qk_nope_head_dim, self.v_head_dim],
          dim=-1,
       )
+
+      print("V:", value_states.shape)
 
       # apply 位置编码 rope
       kv_seq_len = value_states.shape[-2]
@@ -243,6 +256,7 @@ class MLA(nn.Module):
       cos, sin = self.rotary_emb(
          value_states, seq_len=kv_seq_len,
       )
+      #得到q与k的位置编码部分
       q_rope, k_rope = apply_rotary_pos_emb(
          q_rope, k_rope, cos, sin, position_ids,
       )
@@ -256,14 +270,16 @@ class MLA(nn.Module):
       )  # (b, 1, seq_len, dim)
       # shape is( b, num_head,
       #  q_len, head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim)
+      #（batch, heads, seq_len, head_dim) -> [2, 16, 1024, 192]
+      print("Q:", query_states.shape)
+      print("K:", key_states.shape)
 
-      print(query_states.shape, key_states.shape)
-
-      # MHA 无数遍了
-
+      # MHA 无数遍了 [2, 16, 1024, 192] * [2, 16, 1024, 192] 后两维相乘- > [2, 16, 1024, 1024]
       attn_weights = torch.matmul(
          query_states, key_states.transpose(2, 3)
       )
+      print("W:", attn_weights.shape)
+
       attn_weights = attn_weights / math.sqrt(self.q_head_dim)
 
       if attention_mask is not None:
@@ -291,12 +307,11 @@ class MLA(nn.Module):
       )
       output = output.transpose(1, 2).reshape(bsz, q_len, -1)
 
-      # （b, q_len, v_dim * num_head）
-
+      # （b, q_len, v_dim * num_head） 16 * 128 ->7168
       output = self.out_proj(
          output
       )
-
+      print("O:", output.shape)
       return output, attn_weights
 
 
